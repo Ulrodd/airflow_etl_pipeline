@@ -3,6 +3,5 @@ apache-airflow==2.5.1
 apache-airflow-providers-postgres
 apache-airflow-providers-slack
 pandas
-pandera==0.12.2
 sqlalchemy<2.0
 psycopg2-binary

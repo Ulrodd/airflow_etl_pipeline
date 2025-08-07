@@ -2,6 +2,8 @@ from datetime import datetime, timedelta
 import os
 import shutil
 import pandas as pd
+from sqlalchemy import create_engine
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.operators.postgres import PostgresOperator
@@ -73,32 +75,38 @@ with DAG(
     )
 
     # 3) Load into staging table
-    load_staging = PostgresOperator(
+
+    def load_staging():
+        df = pd.read_csv(CLEANED_CSV)
+        engine = create_engine("postgresql+psycopg2://airflow:airflow@postgres:5432/airflow")
+        with engine.connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS online_retail (
+                    invoiceno     VARCHAR,
+                    stockcode     VARCHAR,
+                    description   TEXT,
+                    quantity      INT,
+                    invoicedate   TIMESTAMP,
+                    unitprice     NUMERIC,
+                    customerid    INT,
+                    country       VARCHAR,
+                    total_price   NUMERIC,
+                    year          INT,
+                    month         INT,
+                    day           INT,
+                    weekday       INT,
+                    hour          INT
+                );
+                TRUNCATE online_retail;
+            """)
+            df.to_sql("online_retail", con=conn, if_exists="append", index=False)
+
+
+    load_staging_task = PythonOperator(
         task_id="load_staging",
-        postgres_conn_id="postgres_default",
-        sql=f"""
-          CREATE TABLE IF NOT EXISTS online_retail (
-            invoice_no   VARCHAR,
-            stock_code   VARCHAR,
-            description  TEXT,
-            quantity     INT,
-            invoice_date TIMESTAMP,
-            unit_price   NUMERIC,
-            customer_id  INT,
-            country      VARCHAR,
-            total_price  NUMERIC,
-            year         INT,
-            month        INT,
-            day          INT,
-            weekday      INT,
-            hour         INT
-          );
-          TRUNCATE online_retail;
-          COPY online_retail
-            FROM '{CLEANED_CSV}'
-            WITH (FORMAT csv, HEADER true);
-        """
+        python_callable=load_staging,
     )
+
 
     # 4) Build dims, fact, QA & notify
     with TaskGroup("load") as load_group:
@@ -108,16 +116,20 @@ with DAG(
             postgres_conn_id="postgres_default",
             sql="""
             CREATE TABLE IF NOT EXISTS dim_customer (
-              customer_id INT PRIMARY KEY,
-              country     VARCHAR
+              customerid INT PRIMARY KEY,
+              country    VARCHAR
             );
             CREATE TABLE IF NOT EXISTS dim_product (
-              stock_code VARCHAR PRIMARY KEY,
-              description TEXT
+              stockcode    VARCHAR PRIMARY KEY,
+              description  TEXT
             );
             CREATE TABLE IF NOT EXISTS dim_date (
               date_id DATE PRIMARY KEY,
-              year INT, month INT, day INT, weekday INT, hour INT
+              year    INT,
+              month   INT,
+              day     INT,
+              weekday INT,
+              hour    INT
             );
             """
         )
@@ -127,24 +139,25 @@ with DAG(
             postgres_conn_id="postgres_default",
             sql="""
             CREATE TABLE IF NOT EXISTS fact_sales (
-              invoice_no  VARCHAR,
-              stock_code  VARCHAR,
-              customer_id INT,
-              date_id     DATE,
-              quantity    INT,
-              total_price NUMERIC
+              invoiceno    VARCHAR,
+              stockcode    VARCHAR,
+              customerid   INT,
+              date_id      DATE,
+              quantity     INT,
+              total_price  NUMERIC
             );
             """
         )
+
 
         load_dim_customer = PostgresOperator(
             task_id="load_dim_customer",
             postgres_conn_id="postgres_default",
             sql="""
-            INSERT INTO dim_customer(customer_id, country)
-            SELECT DISTINCT customer_id, country
+            INSERT INTO dim_customer(customerid, country)
+            SELECT DISTINCT customerid, country
               FROM online_retail
-            ON CONFLICT (customer_id) DO NOTHING;
+            ON CONFLICT (customerid) DO NOTHING;
             """
         )
 
@@ -152,10 +165,10 @@ with DAG(
             task_id="load_dim_product",
             postgres_conn_id="postgres_default",
             sql="""
-            INSERT INTO dim_product(stock_code, description)
-            SELECT DISTINCT stock_code, description
+            INSERT INTO dim_product(stockcode, description)
+            SELECT DISTINCT stockcode, description
               FROM online_retail
-            ON CONFLICT (stock_code) DO NOTHING;
+            ON CONFLICT (stockcode) DO NOTHING;
             """
         )
 
@@ -164,7 +177,7 @@ with DAG(
             postgres_conn_id="postgres_default",
             sql="""
             INSERT INTO dim_date(date_id, year, month, day, weekday, hour)
-            SELECT DISTINCT invoice_date::date, year, month, day, weekday, hour
+            SELECT DISTINCT invoicedate::date, year, month, day, weekday, hour
               FROM online_retail
             ON CONFLICT (date_id) DO NOTHING;
             """
@@ -174,8 +187,8 @@ with DAG(
             task_id="load_fact_sales",
             postgres_conn_id="postgres_default",
             sql="""
-            INSERT INTO fact_sales(invoice_no, stock_code, customer_id, date_id, quantity, total_price)
-            SELECT invoice_no, stock_code, customer_id, invoice_date::date, quantity, total_price
+            INSERT INTO fact_sales(invoiceno, stockcode, customerid, date_id, quantity, total_price)
+            SELECT invoiceno, stockcode, customerid, invoicedate::date, quantity, total_price
               FROM online_retail;
             """
         )
@@ -186,20 +199,18 @@ with DAG(
             sql="""
             SELECT
               (SELECT COUNT(*) FROM online_retail) AS src,
-              (SELECT COUNT(*) FROM fact_sales)  AS tgt;
+              (SELECT COUNT(*) FROM fact_sales)    AS tgt;
             """
         )
 
-        notify = SlackWebhookOperator(
-            task_id="slack_notify",
-            http_conn_id="slack_webhook",
-            message="DAG exécuté avec succès",
-            channel="#data-alerts",
-        )
+
 
         create_dimensions >> create_fact \
           >> [load_dim_customer, load_dim_product, load_dim_date] \
-          >> load_fact >> quality_checks >> notify
-
+          >> load_fact >> quality_checks 
     # Orchestration finale
-    extract_task >> transform_task >> load_staging >> load_group
+    extract_task >> transform_task >> load_staging_task >> load_group
+
+
+# Nécessaire pour que le DAG soit reconnu par Airflow
+dag = dag
